@@ -1,6 +1,6 @@
 use ic_asset_certification::{Asset, AssetConfig, AssetFallbackConfig, AssetRouter};
 use ic_cdk::{
-    api::{data_certificate, set_certified_data},
+    api::{certified_data_set, data_certificate},
     *,
 };
 use ic_http_certification::{
@@ -254,10 +254,10 @@ fn certify_all_assets() {
 
     ASSET_ROUTER.with_borrow_mut(|asset_router| {
         if let Err(err) = asset_router.certify_assets(assets, asset_configs) {
-            ic_cdk::trap(&format!("Failed to certify assets: {}", err));
+            ic_cdk::trap(format!("Failed to certify assets: {}", err));
         }
 
-        set_certified_data(&asset_router.root_hash());
+        certified_data_set(asset_router.root_hash());
     });
 }
 
@@ -269,7 +269,7 @@ fn serve_asset(req: &HttpRequest) -> HttpResponse<'static> {
         ) {
             response
         } else {
-            ic_cdk::trap(&format!("Failed to serve asset for request {:?}", req));
+            ic_cdk::trap(format!("Failed to serve asset for request {:?}", req));
         }
     })
 }
