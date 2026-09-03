@@ -1,8 +1,8 @@
 use crate::protocol::validate;
-use crate::{HttpGatewayResponseBody, ResponseBodyStream};
+use crate::{HttpGatewayResponseBody, ResponseBodyStream, ResponseBodyStreamItem};
 use bytes::Bytes;
 use candid::Principal;
-use futures::{stream, Stream, StreamExt, TryStreamExt};
+use futures::{future, stream, Stream, StreamExt, TryStreamExt};
 use http_body::Frame;
 use http_body_util::{BodyExt, Full};
 use ic_agent::{Agent, AgentError};
@@ -87,16 +87,32 @@ fn create_body_stream(
     token: Option<Token>,
     initial_body: Vec<u8>,
 ) -> ResponseBodyStream {
-    let chunks_stream = create_stream(agent, callback, token)
-        .map(|chunk| chunk.map(|(body, _)| Frame::data(Bytes::from(body))));
+    let chunks_stream = create_stream(agent, callback, token).map_ok(|(body, _)| body);
 
-    let body_stream = stream::once(async move { Ok(Frame::data(Bytes::from(initial_body))) })
+    let body_stream = stream::once(async move { Ok(initial_body) })
         .chain(chunks_stream)
         .take(MAX_HTTP_REQUEST_STREAM_CALLBACK_CALL_COUNT)
         .map(|x| async move { x })
         .buffered(STREAM_CALLBACK_BUFFER);
 
-    ResponseBodyStream::new(Box::pin(body_stream))
+    ResponseBodyStream::new(Box::pin(chunks_to_frames(body_stream)))
+}
+
+/// Converts a stream of body chunks into a stream of DATA frames, skipping empty chunks.
+///
+/// The end of the body is signalled by the end of the stream, not by a DATA frame, so an empty
+/// DATA frame carries no information. Over HTTP/2 it would be sent as an empty DATA frame without
+/// the END_STREAM flag, so no empty DATA frames are emitted at all.
+///
+/// This must be applied after `.take(MAX_HTTP_REQUEST_STREAM_CALLBACK_CALL_COUNT)`, so that
+/// skipped chunks still count towards the limit on the number of calls made to the canister.
+fn chunks_to_frames<S>(chunks: S) -> impl Stream<Item = ResponseBodyStreamItem>
+where
+    S: Stream<Item = Result<Vec<u8>, AgentError>>,
+{
+    chunks
+        .try_filter(|body| future::ready(!body.is_empty()))
+        .map_ok(|body| Frame::data(Bytes::from(body)))
 }
 
 fn create_stream(
@@ -299,16 +315,15 @@ fn create_206_body_stream(
     stream_state: StreamState<'static>,
     initial_body: Vec<u8>,
 ) -> ResponseBodyStream {
-    let chunks_stream = create_206_stream(agent, Some(stream_state))
-        .map(|chunk| chunk.map(|(body, _)| Frame::data(Bytes::from(body))));
+    let chunks_stream = create_206_stream(agent, Some(stream_state)).map_ok(|(body, _)| body);
 
-    let body_stream = stream::once(async move { Ok(Frame::data(Bytes::from(initial_body))) })
+    let body_stream = stream::once(async move { Ok(initial_body) })
         .chain(chunks_stream)
         .take(MAX_HTTP_REQUEST_STREAM_CALLBACK_CALL_COUNT)
         .map(|x| async move { x })
         .buffered(STREAM_CALLBACK_BUFFER);
 
-    ResponseBodyStream::new(Box::pin(body_stream))
+    ResponseBodyStream::new(Box::pin(chunks_to_frames(body_stream)))
 }
 
 fn create_206_stream(
@@ -544,5 +559,55 @@ mod tests {
         )];
         let result = get_initial_stream_state(http_request, canister_id, &response_headers, false);
         assert_matches!(result, Err(e) if format!("{}", e).contains("inconsistent Content-Range header"));
+    }
+
+    fn collect_frames(chunks: Vec<Result<Vec<u8>, AgentError>>) -> Vec<ResponseBodyStreamItem> {
+        futures::executor::block_on(chunks_to_frames(stream::iter(chunks)).collect::<Vec<_>>())
+    }
+
+    fn collect_frames_data(chunks: Vec<Result<Vec<u8>, AgentError>>) -> Vec<Bytes> {
+        collect_frames(chunks)
+            .into_iter()
+            .map(|frame| {
+                frame
+                    .expect("unexpected error in body stream")
+                    .into_data()
+                    .expect("expected a DATA frame")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn should_skip_empty_chunks() {
+        let data = collect_frames_data(vec![
+            Ok(vec![]),
+            Ok(vec![1, 2, 3]),
+            Ok(vec![]),
+            Ok(vec![]),
+            Ok(vec![4, 5]),
+            Ok(vec![]),
+        ]);
+        assert_eq!(
+            data,
+            vec![Bytes::from_static(&[1, 2, 3]), Bytes::from_static(&[4, 5])]
+        );
+    }
+
+    #[test]
+    fn should_yield_no_frames_for_empty_body() {
+        let data = collect_frames_data(vec![Ok(vec![]), Ok(vec![])]);
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn should_propagate_errors_when_skipping_empty_chunks() {
+        let frames = collect_frames(vec![
+            Ok(vec![1]),
+            Ok(vec![]),
+            Err(AgentError::InvalidHttpResponse("boom".to_string())),
+        ]);
+        assert_eq!(frames.len(), 2);
+        assert_matches!(&frames[0], Ok(frame) if frame.data_ref() == Some(&Bytes::from_static(&[1])));
+        assert_matches!(&frames[1], Err(AgentError::InvalidHttpResponse(msg)) if msg == "boom");
     }
 }
