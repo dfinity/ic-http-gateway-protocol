@@ -30,3 +30,99 @@ jobs:
       - run: cargo publish --package ic-http-gateway-protocol --allow-dirty
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  release:
+    needs: publish
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write # Required to create the GitHub release
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # Full history and tags, needed to build the changelog
+
+      - name: Generate release notes
+        id: notes
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          CRATE: ic-http-gateway-protocol
+        run: |
+          set -euo pipefail
+
+          REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          VERSION="${TAG#v}"
+          NOTES_FILE="${RUNNER_TEMP}/release-notes.md"
+
+          # Previous release tag reachable from this one (by ancestry, not by date)
+          PREV_TAG="$(git describe --tags --abbrev=0 --match 'v*' "${TAG}^" 2>/dev/null || true)"
+          if [[ -n "${PREV_TAG}" ]]; then
+            RANGE="${PREV_TAG}..${TAG}"
+          else
+            RANGE="${TAG}"
+          fi
+
+          COMMITS="$(git log --no-merges --format="- %s ([%h](${REPO_URL}/commit/%H)) — %an" "${RANGE}")"
+          # Conventional-commit breaking changes, e.g. "chore!: ..." or "feat(api)!: ..."
+          BREAKING="$(grep -E '^- [a-zA-Z]+(\([^)]*\))?!:' <<< "${COMMITS}" || true)"
+
+          {
+            if [[ -n "${BREAKING}" ]]; then
+              echo "## ⚠️ Breaking changes"
+              echo
+              echo "${BREAKING}"
+              echo
+            fi
+            echo "## Commits"
+            echo
+            echo "${COMMITS:-_No commits._}"
+            echo
+            if [[ -n "${PREV_TAG}" ]]; then
+              echo "**Full Changelog**: ${REPO_URL}/compare/${PREV_TAG}...${TAG}"
+              echo
+            fi
+            echo "## Links"
+            echo
+            echo "- crates.io: https://crates.io/crates/${CRATE}/${VERSION}"
+            echo "- docs.rs: https://docs.rs/${CRATE}/${VERSION}"
+          } > "${NOTES_FILE}"
+
+          if [[ "${TAG}" == *-* ]]; then
+            PRERELEASE=true
+          else
+            PRERELEASE=false
+          fi
+
+          # Only mark as "Latest" if this is the highest stable version (not a backport)
+          LATEST_STABLE="$(git tag -l 'v*' | grep -v -e '-' | sort -V | tail -n 1)"
+          if [[ "${PRERELEASE}" == false && "${TAG}" == "${LATEST_STABLE}" ]]; then
+            LATEST=true
+          else
+            LATEST=false
+          fi
+
+          {
+            echo "file=${NOTES_FILE}"
+            echo "prerelease=${PRERELEASE}"
+            echo "latest=${LATEST}"
+          } >> "${GITHUB_OUTPUT}"
+
+          cat "${NOTES_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          NOTES_FILE: ${{ steps.notes.outputs.file }}
+          PRERELEASE: ${{ steps.notes.outputs.prerelease }}
+          LATEST: ${{ steps.notes.outputs.latest }}
+        run: |
+          gh release create "${TAG}" \
+            --verify-tag \
+            --title "${TAG}" \
+            --notes-file "${NOTES_FILE}" \
+            --prerelease="${PRERELEASE}" \
+            --latest="${LATEST}"
